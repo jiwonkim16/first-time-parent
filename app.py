@@ -119,7 +119,8 @@ st.markdown(
         <span class="no">✕</span> 증상을 진단하는 AI &nbsp;→&nbsp; <span class="yes">✓</span> 어떻게 대처할지 교육하는 코치<br>
         <span class="no">✕</span> 병원 갈지 대신 결정 &nbsp;→&nbsp; <span class="yes">✓</span> 상담이 필요한 신호를 알려주기<br>
         <span class="no">✕</span> 육아 정답 제시 &nbsp;→&nbsp; <span class="yes">✓</span> 공식 근거로 선택지 정리하기<br><br>
-        모든 답변 끝에는 <b>실제 상담 연락처</b>를 함께 안내해요. 급하면 먼저 <b>1339</b>로 연락하세요.
+        모든 답변 끝에는 <b>실제 상담 연락처</b>를 함께 안내해요. 급하면 먼저 <b>1339</b>로 연락하세요.<br><br>
+        <span style="color:#9A948A;">※ 이 코치는 <b>생후 12개월 이하</b> 아기를 대상으로 해요.</span>
     </div>
     """,
     unsafe_allow_html=True,
@@ -181,7 +182,7 @@ with st.sidebar:
         st.caption("상담을 시작하려면 아이 정보를 입력해 주세요.")
         with st.form("profile_form"):
             name = st.text_input("아이 이름(또는 애칭)", placeholder="예: 민준")
-            month = st.number_input("생후 개월 수", min_value=0, max_value=60, value=2)
+            month = st.number_input("생후 개월 수", min_value=0, max_value=12, value=2)
             if st.form_submit_button("시작하기", use_container_width=True):
                 if name.strip():
                     st.session_state.profile = {"name": name.strip(), "month": int(month)}
