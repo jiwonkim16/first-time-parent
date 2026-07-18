@@ -74,6 +74,31 @@ st.markdown(
     [data-testid="stChatMessageContent"] { padding-right: 0.5rem; }
     /* 근거 expander */
     [data-testid="stExpander"] { border: none; }
+
+    /* ── 다크모드에서도 사이드바·입력창을 밝게 고정 ──────────────
+       config.toml에 더해 이중 안전장치. 시스템 테마와 무관하게
+       사이드바/입력창 배경을 흰색·글씨를 잉크색으로 명시한다. */
+    [data-testid="stSidebar"] {
+        background: #FFFFFF; border-right: 1px solid #EAE3D6;
+    }
+    [data-testid="stSidebar"] * { color: var(--ink); }
+    /* 채팅 입력창 — 배경 흰색, 입력 텍스트/placeholder 가독성 확보 */
+    [data-testid="stChatInput"] { background: #FFFFFF; }
+    [data-testid="stChatInput"] textarea {
+        color: var(--ink) !important; -webkit-text-fill-color: var(--ink) !important;
+    }
+    [data-testid="stChatInput"] textarea::placeholder { color: #9A948A !important; }
+    /* 사이드바 입력 위젯 (이름·개월수) 배경·글씨 */
+    [data-testid="stSidebar"] input {
+        background: #FBF7F0 !important; color: var(--ink) !important;
+        -webkit-text-fill-color: var(--ink) !important;
+    }
+    /* 예시 질문 버튼 */
+    .stButton button {
+        background: #FFFFFF; color: var(--ink); border: 1px solid #EAE3D6;
+        border-radius: 12px; font-size: 0.86rem; text-align: left;
+    }
+    .stButton button:hover { border-color: var(--sage); color: var(--sage-deep); }
     </style>
     """,
     unsafe_allow_html=True,
@@ -111,14 +136,23 @@ _BADGE = {
 
 
 def badge_html(out: dict) -> str:
-    """에이전트 결과를 위험도 배지 + 판단 근거로 렌더링."""
+    """에이전트 결과를 위험도 배지 + 판단 근거로 렌더링.
+
+    clarify(되묻기)·out_of_scope는 위험도 판단을 하지 않으므로 risk 키가 없다.
+    """
     if not out.get("in_scope", True):
         return '<span class="badge scope">🔍 역할 범위 밖</span>'
+    if out.get("needs_clarification"):
+        return '<span class="badge scope">💬 조금 더 여쭤볼게요</span>'
+    if "risk" not in out:  # 방어: 예기치 못한 경로
+        return ""
     cls, label = _BADGE[out["risk"]]
+    src = out.get("source_status")
+    src_note = " · 📎 공식 근거" if src == "found" else ""
     return (
         f'<span class="{cls}">{label}</span>'
         f'<span style="font-size:0.78rem;color:#9A948A;margin-left:0.6rem;">'
-        f'LLM {out["llm_risk"]} · rule {out["rule_risk"]}</span>'
+        f'LLM {out["llm_risk"]} · rule {out["rule_risk"]}{src_note}</span>'
     )
 
 
@@ -166,10 +200,29 @@ for msg in st.session_state.history:
             st.markdown(msg["badge"], unsafe_allow_html=True)
         st.markdown(msg["content"])
 
+# 첫 화면 예시 질문 — 무엇을 물어볼 수 있는지 보여줘 첫 진입 장벽을 낮춘다.
+# 클릭하면 그 문장이 그대로 입력으로 들어간다. (대화 시작 후엔 숨김)
+EXAMPLES = [
+    "밤에 자주 깨서 안아줘야 겨우 자요",
+    "요즘 이유식을 자꾸 뱉어내요",
+    "또래보다 뒤집기가 늦은 것 같아요",
+    "열이 38도인데 평소보다 축 처져요",
+]
+chip_prompt = None
+if not st.session_state.history:
+    st.caption("이런 걸 물어볼 수 있어요")
+    cols = st.columns(2)
+    for i, ex in enumerate(EXAMPLES):
+        if cols[i % 2].button(ex, key=f"ex_{i}", use_container_width=True):
+            chip_prompt = ex
+
 # ─────────────────────────────────────────────────────────
 # 입력 → 그래프 실행 → 렌더
 # ─────────────────────────────────────────────────────────
-if prompt := st.chat_input("예: 우리 애 2개월인데 열이 39도예요"):
+# st.chat_input은 조건 없이 '항상' 호출해야 매 rerun마다 화면에 그려진다.
+# (or 단축평가로 건너뛰면 그 rerun에서 입력창이 사라진다.)
+typed = st.chat_input("예: 우리 애 2개월인데 열이 39도예요")
+if prompt := (typed or chip_prompt):
     st.session_state.history.append({"role": "user", "content": prompt})
     with st.chat_message("user", avatar="🧑"):
         st.markdown(prompt)
@@ -179,13 +232,42 @@ if prompt := st.chat_input("예: 우리 애 2개월인데 열이 39도예요"):
             # 세션 프로필(이름·월령)을 그래프 초기 State로 주입.
             # analyze가 월령을 추출하지 않으므로 여기서 넘겨줘야 한다.
             p = st.session_state.profile
-            out = graph.invoke(
-                {"input": prompt, "name": p["name"], "month": p["month"]}
+            # 다중턴 맥락: 최근 대화 이력을 그래프에 함께 넘긴다 (체크포인터 대신
+            # session_state 사용 — §11 비영속 원칙 준수). 직전 몇 턴만 요약해 전달.
+            recent = st.session_state.history[-6:-1]  # 방금 넣은 user 메시지 제외
+            history_text = "\n".join(
+                f"{'부모' if m['role'] == 'user' else '코치'}: {m['content'][:300]}"
+                for m in recent
             )
-        badge = badge_html(out)
-        st.markdown(badge, unsafe_allow_html=True)
-        st.markdown(out["answer"])
+            try:
+                out = graph.invoke(
+                    {
+                        "input": prompt,
+                        "history": history_text,
+                        "name": p["name"],
+                        "month": p["month"],
+                    }
+                )
+            except Exception as e:
+                # 키 누락·네트워크·API 오류 등: 트레이스백 대신 친화적 안내 (체크리스트).
+                # 급한 상황을 대비해 상담 연락처는 항상 노출한다.
+                out = None
+                st.error(
+                    "⚠️ 지금 답변을 불러오지 못했어요. 잠시 후 다시 시도해 주세요.\n\n"
+                    "**급한 상황이라면 지체 없이 아래로 연락하세요.**\n"
+                    "- 야간·주말 응급 상담: **응급의료포털 1339**\n"
+                    "- 육아 종합 상담: **육아종합지원센터 1577-0756**"
+                )
+                with st.expander("문제 원인 (개발자용)"):
+                    st.caption(f"{type(e).__name__}: {e}")
 
-    st.session_state.history.append(
-        {"role": "assistant", "content": out["answer"], "badge": badge}
-    )
+        if out is not None:
+            badge = badge_html(out)
+            if badge:
+                st.markdown(badge, unsafe_allow_html=True)
+            st.markdown(out["answer"])
+
+    if out is not None:
+        st.session_state.history.append(
+            {"role": "assistant", "content": out["answer"], "badge": badge}
+        )

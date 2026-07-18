@@ -13,7 +13,10 @@ wheels/
 # macOS
 .DS_Store
 
-.streamlit
+.streamlit/*
+!.streamlit/config.toml
 *.db
 *.db-shm
 .adk
+
+docs/superpowers/*

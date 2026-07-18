@@ -1,0 +1,8 @@
+# 시스템 다크모드와 무관하게 앱을 항상 라이트 테마로 고정한다.
+# (다크모드일 때 사이드바·입력창 글씨가 안 보이던 문제 해결)
+[theme]
+base = "light"
+primaryColor = "#7C9A80"          # sage — 버튼·강조
+backgroundColor = "#FBF7F0"        # cream — 본문 배경
+secondaryBackgroundColor = "#FFFFFF"  # 사이드바·입력창·카드 배경
+textColor = "#3A3A38"              # ink — 본문 글씨

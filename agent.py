@@ -1,4 +1,4 @@
-"""부모는 처음이라 — 교육형 육아 코치 (LangGraph 병렬 워크플로우).
+"""부모는 처음이라 — 교육형 육아 코치 (LangGraph 워크플로우).
 
 이 에이전트의 정체성 (기획문서 §2):
     ❌ 아기 증상을 진단하는 AI          ✅ 부모의 의사결정을 돕는 교육 코치
@@ -11,37 +11,71 @@
 ── 그래프 흐름 (기획 §5) ──────────────────────────────────
     START
       ↓
-    analyze  ── 자연어→구조화. 육아 무관이면 out_of_scope로 조기 종료
-      ↓ (육아 질문일 때만)
-    ┌── llm_risk  ‖  rule_risk ──┐   ← 병렬 처리(Parallelization)
+    analyze  ── 자연어→구조화 (in_scope·red_flags·되묻기 여부 추출)
+      ↓ (route_clarify) 정보 부족? ──→ clarify → END
+      ↓ (route_scope)   육아 무관? ──→ out_of_scope → END
+    ┌── llm_risk  ‖  rule_risk ──┐   ← 병렬 처리(Parallelization + voting)
     └──────── aggregate ─────────┘   ← finalRisk = max(llm, rule) 보수적 채택
-      ↓
-    route_by_risk (3-way 조건부 분기)
-      ├ high  → decide                    (교육 생략, 즉시 병원 안내)
-      ├ warn  → search → decide           (근거 조회 후 병원 권고 + 교육)
-      └ low   → coach → search → decide   (주제별 관점 코칭 + 7단 교육)
+      ↓ (route_by_risk) 3-way 분기
+      ├ high → decide                    (교육 생략, 즉시 병원 안내)
+      └ warn/low → search → coach → decide
       ↓
     END
 ────────────────────────────────────────────────────────
+
+적용한 학습 개념 (노션 노트):
+- State·Node·조건부 Edge (노트1)
+- 병렬화 + voting + aggregator (노트4): llm_risk ‖ rule_risk → aggregate(max)
+- 라우팅 조건부 분기 (노트1·4): route_clarify / route_scope / route_by_risk
+- Tool + bind_tools + ToolNode + tools_condition ReAct 루프 (노트2): search_node
+- structured_output으로 == 단정 유지 (노트3·4): Extracted / RiskVerdict
+
+의도적으로 제외 (스펙 충돌):
+- 체크포인터 / Time Travel / interrupt-HITL (§11 미성년자 비영속 원칙)
+- 멀티에이전트 (§5: 자율 멀티에이전트 아님, role-separated workflow)
 """
 
-from typing import Literal, Optional
+import os
+from typing import Literal
 
 from dotenv import load_dotenv
 from langchain.chat_models import init_chat_model
+from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.tools import tool
 from langgraph.graph import END, START, StateGraph
+from langgraph.prebuilt import ToolNode
 from pydantic import BaseModel, Field
 from typing_extensions import TypedDict
 
+# 키 확보 우선순위: 이미 설정된 환경변수 → 로컬 .env → Streamlit Cloud secrets.
+# Cloud엔 .env가 없고 st.secrets로만 키가 들어오므로 이 fallback이 배포의 급소다.
 load_dotenv()
+if not os.getenv("OPENAI_API_KEY"):
+    try:
+        import streamlit as st
+
+        os.environ["OPENAI_API_KEY"] = st.secrets["OPENAI_API_KEY"]
+    except Exception:
+        # Streamlit 밖(예: self-check)이거나 secrets 미설정. init_chat_model이 알아서 에러낸다.
+        pass
 
 # temperature=0: 위험도 판단은 재현 가능해야 하므로 무작위성을 제거한다.
-llm = init_chat_model("openai:gpt-4o-mini", temperature=0)
+llm = init_chat_model("openai:gpt-4o", temperature=0)
 
 Risk = Literal["high", "warn", "low"]
 # 위험도를 정수로 매핑해 max() 비교가 가능하게 한다. (문자열 비교로는 순서가 틀림)
 _RISK_RANK = {"low": 0, "warn": 1, "high": 2}
+
+# rule guardrail로 감지하는 응급 신호 (§7 근거표의 [rule] 항목 중 유·무로 떨어지는 것).
+# 전부 근거표상 '높음' 신호이므로, 하나라도 있으면 rule이 high로 강제 상향한다.
+RedFlag = Literal[
+    "seizure",  # 경련/발작 — AAP·CDC·아이사랑
+    "unconscious",  # 의식소실/깨워도 무반응 — AAP·CDC
+    "no_urine_8h",  # 소변 8시간 이상 없음(탈수) — CDC
+    "bilious_or_bloody_vomit",  # 구토에 담즙(초록)·혈액·커피색 — AAP·아이사랑
+    "vomiting_over_24h",  # 구토 24시간 이상 지속 — AAP
+    "head_injury_followup",  # 낙상+머리충격 후 의식소실/구토2회↑/각성곤란 — AAP
+]
 
 # 응답마다 붙는 실제 상담 자원 연락처 (기획 §4). 진단 도구가 아니므로
 # 최종 판단은 항상 사람(의료진/상담센터)에게 연결한다.
@@ -62,30 +96,60 @@ CONTACT_FOOTER = (
 # ─────────────────────────────────────────────────────────
 class State(TypedDict):
     input: str
-    name: str                  # 세션 프로필: 아이 이름 (UI에서 주입, 그래프 밖에서 관리)
-    month: int                 # 세션 프로필: 월령 (UI에서 주입 — analyze가 덮어쓰지 않음)
-    in_scope: bool             # analyze가 판정: 육아 질문인가?
+    history: str  # 최근 대화 이력 요약 (UI의 session_state에서 주입 — 다중턴 맥락)
+    name: str  # 세션 프로필: 아이 이름 (UI에서 주입, 그래프 밖에서 관리)
+    month: int  # 세션 프로필: 월령 (UI에서 주입 — analyze가 덮어쓰지 않음)
+    in_scope: bool  # analyze 판정: 육아 질문인가?
+    needs_clarification: bool  # analyze 판정: 되묻기가 필요한가? (§7)
+    clarify_question: str  # 되묻을 질문 문장
+    red_flags: list[str]  # analyze가 감지한 응급 신호 (rule 입력)
     temp: float
     symptoms: str
     topic: str
-    llm_risk: Risk             # LLM 판단 (병렬 branch 1)
-    rule_risk: Risk            # 결정론적 rule 판단 (병렬 branch 2)
-    risk: Risk                 # aggregate가 max()로 합친 최종값
-    source: str
+    llm_risk: Risk  # LLM 판단 (병렬 branch 1)
+    rule_risk: Risk  # 결정론적 rule 판단 (병렬 branch 2)
+    risk: Risk  # aggregate가 max()로 합친 최종값
+    source: str  # 근거 검색 결과 원문
+    source_status: Literal["found", "not_found"]  # §9 매트릭스 가로축
     answer: str
 
 
 # ─────────────────────────────────────────────────────────
 # 2. 구조화 추출/판단 스키마 — LLM이 자유 텍스트 대신 이 형태로만 답하게 강제
+#    (노트3: 출력 공간을 좁혀 다운스트림에서 == 단정을 유지)
 # ─────────────────────────────────────────────────────────
 class Extracted(BaseModel):
     """analyze 노드가 자연어에서 뽑아낼 구조. 월령은 세션 프로필에서 오므로 추출하지 않는다."""
 
-    in_scope: bool = Field(description="육아/아기 건강 관련 질문이면 true, 아니면 false")
+    in_scope: bool = Field(
+        description="육아/아기 건강 관련 질문이면 true, 아니면 false"
+    )
     temp: float = Field(description="체온(섭씨). 언급 없으면 0")
     symptoms: str = Field(description="부모가 호소한 주요 상황/증상 요약")
     topic: Literal["수면", "수유", "발달", "안전", "건강"] = Field(
         description="가장 관련 있는 주제(코칭 관점)"
+    )
+    red_flags: list[RedFlag] = Field(
+        default_factory=list,
+        description=(
+            "부모 서술에서 명확히 확인되는 응급 신호만 고른다. 추측하지 말 것. "
+            "seizure=경련/발작, unconscious=의식소실/깨워도 무반응, "
+            "no_urine_8h=소변 8시간 이상 없음, "
+            "bilious_or_bloody_vomit=구토에 담즙(초록)·혈액·커피색, "
+            "vomiting_over_24h=구토 24시간 이상 지속, "
+            "head_injury_followup=낙상/머리충격 후 의식소실·구토 2회 이상·각성곤란"
+        ),
+    )
+    needs_clarification: bool = Field(
+        description=(
+            "위험도를 가늠하려면 꼭 필요한 핵심 정보(예: 발열을 호소했는데 체온 수치가 없음)가 "
+            "빠져 있으면 true. 일상 질문이라 추가 정보가 필요 없으면 false. "
+            "정보 부족은 '낮음'의 근거가 아니라 되묻기의 근거다(§7)."
+        )
+    )
+    clarify_question: str = Field(
+        default="",
+        description="needs_clarification가 true일 때, 부모에게 되물을 다정한 한 문장.",
     )
 
 
@@ -97,52 +161,128 @@ class RiskVerdict(BaseModel):
 
 
 # ─────────────────────────────────────────────────────────
-# 3. 근거 검색 도구 (기획 §8의 "조준" 방식 stub)
-#    ponytail: 실제 라이브 검색/RAG는 defer. 월령×주제 라우팅의 뼈대만 dict로.
-#    add when 공식 사이트 크롤링/allowed_domains 라이브 검색이 필요해질 때.
+# 3. 근거 검색 — §8 레지스트리 + Tool (노트2: docstring이 LLM 명세)
+#    월령 밴드 × 주제로 공식 페이지 URL을 조회한다.
+#    ponytail: 실제 라이브 fetch는 defer(외부 네트워크·Cloud 불안정). 검증된 URL dict.
+#    add when 공식 사이트 라이브 크롤링/allowed_domains 검색이 필요해질 때.
 # ─────────────────────────────────────────────────────────
-GUIDE_TABLE = {
-    "수면": "아이사랑 - 안전 수면 원칙 (childcare.go.kr)",
-    "수유": "아이사랑 - 월령별 수유량 가이드 (childcare.go.kr)",
-    "발달": "아이사랑 - 월령별 발달 이정표 (childcare.go.kr)",
-    "안전": "아이사랑 - 영유아 생활안전 가이드 (childcare.go.kr)",
-    "건강": "질병관리청 - 영유아 발열/증상 대응 (health.kdca.go.kr)",
+def _band(month: int) -> str:
+    """월령을 §8 레지스트리 밴드로 정규화."""
+    if month <= 3:
+        return "1~3"
+    if month <= 6:
+        return "4~6"
+    if month <= 9:
+        return "7~9"
+    return "10~12"
+
+
+# (밴드, 주제) → "기관 - 제목 (URL)" — §8 1차 직접 URL 레지스트리에서 발췌
+GUIDE_REGISTRY = {
+    ("1~3", "수면"): "아이사랑 - 1~3개월 수면 (https://www.childcare.go.kr/?menuno=431)",
+    ("1~3", "건강"): "아이사랑 - 1~3개월 건강과 일상 (https://www.childcare.go.kr/?menuno=432)",
+    ("4~6", "발달"): "아이사랑 - 4~6개월 발달 (https://www.childcare.go.kr/?menuno=290)",
+    ("4~6", "안전"): "아이사랑 - 4~6개월 안전 (https://www.childcare.go.kr/?menuno=436)",
+    ("4~6", "수유"): "아이사랑 - 4~6개월 수유·이유식 (https://www.childcare.go.kr/?menuno=437)",
+    ("4~6", "수면"): "아이사랑 - 4~6개월 배설·수면 (https://www.childcare.go.kr/?menuno=438)",
+    ("4~6", "건강"): "아이사랑 - 4~6개월 건강과 일상 (https://www.childcare.go.kr/?menuno=439)",
+    ("7~9", "발달"): "아이사랑 - 7~9개월 발달 (https://www.childcare.go.kr/?menuno=291)",
+    ("7~9", "수유"): "아이사랑 - 7~9개월 수유·영양 (https://www.childcare.go.kr/?menuno=443)",
+    ("7~9", "수면"): "아이사랑 - 7~9개월 배설·수면 (https://www.childcare.go.kr/?menuno=444)",
+    ("7~9", "건강"): "아이사랑 - 7~9개월 건강과 일상 (https://www.childcare.go.kr/?menuno=445)",
+    ("10~12", "발달"): "아이사랑 - 10~12개월 발달 (https://www.childcare.go.kr/?menuno=292)",
+    ("10~12", "안전"): "아이사랑 - 10~12개월 행동·안전 (https://www.childcare.go.kr/?menuno=448)",
+    ("10~12", "수유"): "아이사랑 - 10~12개월 수유·영양 (https://www.childcare.go.kr/?menuno=449)",
+    ("10~12", "건강"): "아이사랑 - 10~12개월 건강과 일상 (https://www.childcare.go.kr/?menuno=451)",
+}
+
+# 밴드에 없는 (주제) 보완용 — 전월령 공통 공식 페이지
+GUIDE_FALLBACK = {
+    "수면": "CDC - 안전 수면(SUID) (https://www.cdc.gov/sudden-infant-death/sleep-safely/)",
+    "발달": "CDC - 발달 이정표 (https://www.cdc.gov/milestones)",
+    "건강": "질병관리청 - 영유아 식이·탈수 (https://health.kdca.go.kr/healthinfo/)",
 }
 
 
+def lookup_guide(month: int, topic: str) -> str:
+    """월령·주제로 §8 레지스트리에서 공식 근거를 찾는다. 없으면 'NOT_FOUND'.
+
+    순수 함수(테스트 가능). tool과 노드가 공유한다.
+    """
+    hit = GUIDE_REGISTRY.get((_band(month), topic))
+    if hit:
+        return hit
+    fb = GUIDE_FALLBACK.get(topic)
+    return fb if fb else "NOT_FOUND"
+
+
 @tool
-def search_official_guide(month: int, topic: str) -> str:
-    """월령과 주제로 공신력 있는 기관의 근거 페이지를 조회한다."""
-    return GUIDE_TABLE.get(topic, "확인된 공식 자료를 찾지 못했습니다.")
+def search_national_guide(month: int, topic: str) -> str:
+    """월령(개월 수)과 주제로 공신력 있는 기관의 육아 근거 페이지를 조회한다.
+
+    주제는 '수면', '수유', '발달', '안전', '건강' 중 하나여야 한다.
+    아이사랑(childcare.go.kr)·CDC·질병관리청 등 공식 자료의 제목과 URL을 돌려준다.
+    부모에게 근거 있는 교육 답변을 하기 전, 반드시 이 도구로 공식 자료를 확인하라.
+    """
+    return lookup_guide(month, topic)
+
+
+# search 노드가 LLM에게 tool을 쓸 수 있다고 알리기 위한 바인딩 (노트2: bind_tools)
+_llm_with_search = llm.bind_tools([search_national_guide])
+_search_tool_node = ToolNode([search_national_guide])
 
 
 # ─────────────────────────────────────────────────────────
 # 4. 노드 정의
 # ─────────────────────────────────────────────────────────
 def analyze_node(state: State):
-    """자연어 입력 → 구조화. 육아 무관 질문은 in_scope=False로 걸러낸다 (기획 §8).
+    """자연어 입력 → 구조화 (기획 §5·§7·§8).
 
-    월령(month)은 세션 프로필에서 이미 State에 들어와 있으므로 여기서 추출하지 않는다.
-    → 부모가 매번 개월수를 말할 필요가 없고, §7 '되묻기' 월령 문제도 사라진다.
+    in_scope(육아 여부), red_flags(응급 신호), needs_clarification(되묻기),
+    temp/symptoms/topic을 한 번에 추출한다. 월령은 세션 프로필에서 이미 오므로 추출 안 함.
     """
+    history = state.get("history") or "(이전 대화 없음)"
     result = llm.with_structured_output(Extracted).invoke(
-        "다음은 부모가 아이에 대해 한 말이다. 정보를 추출하라. "
-        "육아·아기 건강과 무관한 질문(제품 추천, 일반 상식 등)이면 in_scope=false로 판정하라.\n"
-        f"입력: {state['input']}"
+        "너는 부모의 말을 구조화해 추출하는 분석기다. 아래 '이전 대화'와 '이번 입력'을 "
+        "함께 읽고, 두 곳의 정보를 모두 반영해 판단하라. 이전 대화에서 이미 나온 정보는 "
+        "다시 묻지 마라.\n"
+        f"아이 개월수: {state['month']}개월 (이미 알고 있으니 절대 되묻지 마라).\n"
+        "육아·아기 건강과 무관한 질문(제품 추천, 일반 상식 등)이면 in_scope=false로 판정하라. "
+        "응급 신호(red_flags)는 서술에서 '명확히 확인되는' 것만 고르고 추측하지 마라. "
+        "needs_clarification은 정말로 위험도를 가늠할 수 없을 때만 true로 하라. "
+        "개월수·이전 대화로 이미 충분히 판단 가능한 일상 발달/수면/수유 질문은 되묻지 말고 "
+        "false로 두고 바로 답하라. true면 되물을 질문을 clarify_question에 적어라.\n"
+        f"── 이전 대화 ──\n{history}\n"
+        f"── 이번 입력 ──\n{state['input']}"
     )
     return {
         "in_scope": result.in_scope,
         "temp": result.temp,
         "symptoms": result.symptoms,
         "topic": result.topic,
+        "red_flags": list(result.red_flags),
+        "needs_clarification": result.needs_clarification,
+        "clarify_question": result.clarify_question,
     }
+
+
+def clarify_node(state: State):
+    """정보 부족 시 되묻기 (기획 §7). 위험 판단으로 넘어가지 않고 질문을 답으로 돌려준다."""
+    child = state.get("name") or "아이"
+    q = state.get("clarify_question") or "조금만 더 자세히 알려주실 수 있을까요?"
+    answer = (
+        f"조금 더 정확히 도와드리기 위해 여쭤볼게요. 🙂\n\n"
+        f"**{q}**\n\n"
+        f"{child}의 상황을 알려주시면 위험도를 살펴보고 안내해 드릴게요."
+    )
+    return {"answer": answer + CONTACT_FOOTER}
 
 
 def llm_risk_node(state: State):
     """LLM이 맥락을 읽어 위험도를 판단 (병렬 branch 1).
 
-    정체성: '트리아지 보조'가 아니라 교육 코치의 관점. 진단이 아니라
-    '병원 상담이 필요한 신호인지'를 보수적으로 가늠한다 (기획 §7).
+    수치화 불가한 [LLM] 참고신호(축 처짐·호흡 이상·눈맞춤 안 됨 등)를 여기서 감지한다.
+    진단이 아니라 '병원 상담이 필요한 신호인지'를 보수적으로 가늠한다 (기획 §7).
     """
     verdict = llm.with_structured_output(RiskVerdict).invoke(
         "너는 초보 부모를 돕는 육아 교육 코치다. 진단은 하지 않는다. "
@@ -151,7 +291,8 @@ def llm_risk_node(state: State):
         "다음은 특별한 동반 신호가 없으면 low로 보라: 수면 패턴 변화(자주 깸·낮잠 거부), "
         "평소보다 조금 덜 먹음, 월령별 발달 걱정(뒤집기·앉기 등), 이유식 거부, "
         "힘들어하지 않는 변비. "
-        "반대로 축 처짐·수유 거부·호흡 이상·경련 같은 동반 신호가 있으면 위험도를 올려라. "
+        "반대로 축 처짐·수유 거부·호흡 이상(가쁨·청색증·늑골 함몰)·눈맞춤 안 됨·"
+        "탈수 정성징후(입 마름·눈물 없음·소천문 함몰) 같은 동반 신호가 있으면 위험도를 올려라. "
         "위험도를 high/warn/low 중 하나로 답하라.\n"
         f"개월수: {state['month']}, 체온: {state['temp']}℃, 상황: {state['symptoms']}"
     )
@@ -159,21 +300,26 @@ def llm_risk_node(state: State):
 
 
 def rule_risk_node(state: State):
-    """근거 확정된 결정론적 rule (병렬 branch 2). 안전측 최소 위험도 강제 상향.
+    """근거 확정된 결정론적 rule guardrail (병렬 branch 2). 안전측 최소 위험도 강제 상향.
 
-    ponytail: 기획 §7의 전체 rule 테이블(경련/의식소실/구토 담즙 등) 중 대표 subset만.
-    발열 월령 밴드(AAP 기준)를 구현. add when 나머지 OR 신호까지 코드화할 때.
-    체온 기준은 직장 체온 가정(측정부위 정규화는 defer).
+    §7 근거표의 [rule] 신호를 코드화. 신호는 OR 결합(하나라도 참이면 발동).
+    - red_flags(경련·의식소실·소변8h·담즙/혈액구토·구토24h·낙상후) → 전부 high 신호
+    - 발열 월령 밴드 (AAP/CDC)
+    ponytail: 체온은 직장 기준 가정(측정부위 정규화는 defer, §7).
     """
-    month, temp = state["month"], state["temp"]
-    # 신호는 OR 결합: 하나라도 참이면 발동 (기획 §7 "신호 결합 규칙")
-    if 0 <= month <= 3 and temp >= 38.0:        # AAP: 3개월 이하 38℃↑ 즉시 진료
+    month = state["month"]
+    temp = state.get("temp", 0.0)
+    red_flags = state.get("red_flags") or []
+
+    if red_flags:  # 근거표상 전부 '높음' 신호이므로 하나라도 있으면 high
         risk: Risk = "high"
-    elif temp >= 40.0:                          # CDC: 전월령 40℃↑
+    elif 0 <= month <= 3 and temp >= 38.0:  # AAP: 3개월(90일) 이하 38℃↑
         risk = "high"
-    elif 3 < month <= 6 and temp >= 38.3:       # AAP: 3~6개월 38.3℃↑
+    elif temp >= 40.0:  # CDC: 전월령 40℃↑
+        risk = "high"
+    elif 3 < month <= 6 and temp >= 38.3:  # AAP: 3~6개월 38.3℃↑
         risk = "warn"
-    elif month > 6 and temp >= 39.4:            # AAP: 6개월↑ 39.4℃↑
+    elif month > 6 and temp >= 39.4:  # AAP: 6개월↑ 39.4℃↑
         risk = "warn"
     else:
         risk = "low"
@@ -191,27 +337,58 @@ def aggregate_node(state: State):
 
 
 def search_node(state: State):
-    """공식 근거를 조회 (warn/low 경로). 못 찾으면 '근거 없음'으로 진행 (기획 §9)."""
-    result = search_official_guide.invoke(
-        {"month": state["month"], "topic": state["topic"]}
+    """공식 근거 조회 (warn/low 경로) — ReAct 루프 (노트2).
+
+    LLM에게 search 도구를 쥐여주고(bind_tools) 스스로 호출하게 한 뒤,
+    ToolNode로 실제 실행해 결과를 얻는다. workflow와 agent의 차이를 드러내는 지점:
+    여기서만 '무슨 도구를 어떻게 호출할지'를 LLM이 결정한다.
+    ponytail: 단일 왕복(1회 tool 호출)으로 제한 — 근거 조회는 1회면 충분,
+    무한 ReAct 루프·비용을 막는다. add when 다단계 근거 종합이 필요해질 때.
+    """
+    ai: AIMessage = _llm_with_search.invoke(
+        [
+            HumanMessage(
+                f"개월수 {state['month']}개월, 주제 '{state['topic']}'에 맞는 "
+                f"공식 육아 근거를 search_national_guide 도구로 조회해줘."
+            )
+        ]
     )
-    return {"source": result}
+    if not ai.tool_calls:
+        # LLM이 도구를 안 불렀으면 근거 없이 진행 (§9: 침묵 대신 not_found로)
+        return {"source": "NOT_FOUND", "source_status": "not_found"}
+
+    tool_result = _search_tool_node.invoke({"messages": [ai]})
+    source = tool_result["messages"][-1].content
+    status = "not_found" if source.strip() == "NOT_FOUND" else "found"
+    return {"source": source, "source_status": status}
 
 
 def coach_node(state: State):
     """주제(topic)를 관점(lens)으로 쓰는 단일 코칭 노드 (근거 있는 low/warn, 기획 §6·§10).
 
-    독립된 5개 노드가 아니라, 프롬프트에 topic을 주입해 관점만 바꾼다.
-    search 뒤에 실행되므로 state['source']에 실제 근거가 채워져 있고,
-    이를 5번 섹션에 인용한다. 위험도(risk)를 넘겨 warn/low 톤을 구분한다.
+    독립된 5개 노드가 아니라, 프롬프트에 topic을 주입해 관점만 바꾼다(§5 단일 생성기).
+    search 뒤에 실행되므로 state['source']·source_status가 채워져 있고, 이를 반영한다.
     """
-    tone = (
-        "위험도는 '주의'다. 오늘 중 소아과 방문을 권하는 톤으로, 2번 위험도 판단에서 이를 명확히 하라."
-        if state["risk"] == "warn"
-        else "위험도는 '낮음'이다. 집에서 관찰 가능하다는 안심되는 톤으로 답하라."
-    )
-    # 세션 프로필의 이름으로 개인화 (없으면 '아이'). 그래프 밖 UI에서 주입된 값.
     child = state.get("name") or "아이"
+    found = state.get("source_status") == "found"
+
+    if state["risk"] == "warn":
+        tone = "위험도는 '주의'다. 오늘 중 소아과 방문을 권하는 톤으로, 2번 위험도 판단에서 이를 명확히 하라."
+    else:
+        tone = "위험도는 '낮음'이다. 집에서 관찰 가능하다는 안심되는 톤으로 답하라."
+
+    if found:
+        source_line = (
+            f"5번 섹션에는 아래 '참고 근거'의 출처(기관명·URL)를 반드시 명시하라.\n"
+            f"참고 근거: {state.get('source')}"
+        )
+    else:
+        # §9: 근거 없음 — 없는 출처를 지어내지 말 것
+        source_line = (
+            "확인된 공식 자료가 없다. 5번 섹션에서 특정 기관을 출처로 지어내지 말고, "
+            "'공식 문서에 특정 기준이 없다'는 점을 밝힌 뒤 일반적인 안내만 하라."
+        )
+
     answer = llm.invoke(
         "너는 초보 부모를 돕는 육아 교육 코치다. 진단·처방은 하지 않고, "
         "부모가 스스로 판단하도록 교육한다. 아래 상황을 다음 7단 구조로 한국어로 답하라. "
@@ -220,32 +397,50 @@ def coach_node(state: State):
         "4) 🚫 하지 말아야 할 일  5) 📖 왜 그런지 (근거 포함)  "
         "6) 👁 앞으로 관찰할 기준  7) 🏥 병원 상담이 필요한 신호\n"
         f"{tone}\n"
-        "5번 섹션에는 아래 '참고 근거'의 출처를 반드시 명시하라.\n"
+        f"{source_line}\n"
         f"아이 이름: {child} (자연스럽게 이름을 불러 개인화하라)\n"
         f"관점(주제): {state['topic']}\n"
-        f"개월수: {state['month']}, 상황: {state['symptoms']}\n"
-        f"참고 근거: {state.get('source', '확인된 자료 없음')}"
+        f"개월수: {state['month']}, 상황: {state['symptoms']}"
     ).content
     return {"answer": answer}
 
 
 def decide_node(state: State):
-    """최종 응답 확정 (기획 §5의 합류점). 연락처를 항상 덧붙인다.
+    """최종 응답 확정 — §9 소스×위험도 매트릭스. 연락처를 항상 덧붙인다.
 
-    - high: 교육 생략, 즉시 병원/응급 안내 (기획 §9)
-    - warn/low: coach_node가 이미 7단 answer를 채웠으므로 그대로 사용
+    high: 근거 유무 무관 즉시 병원 안내.
+    warn/low: coach가 만든 7단 answer를 쓰되, 근거 없음이면 고지 문구를 앞에 붙인다.
     """
-    if state["risk"] == "high":
-        child = state.get("name") or "아이"
+    risk = state["risk"]
+    source_status = state.get("source_status", "not_found")
+    child = state.get("name") or "아이"
+
+    if risk == "high":
         answer = (
             f"🚨 **지금 바로 소아청소년과 또는 응급 상담에 연락하세요.**\n\n"
-            f"{child}의 '{state['symptoms']}' 상황은 즉시 전문가 확인이 필요한 신호로 보입니다. "
-            f"저는 진단을 하지 않으며, 지체 없이 아래 연락처로 상담하시길 권합니다."
+            f"{child}의 '{state.get('symptoms', '현재')}' 상황은 즉시 전문가 확인이 "
+            f"필요한 신호로 보입니다. 저는 진단을 하지 않으며, 지체 없이 아래 연락처로 "
+            f"상담하시길 권합니다."
         )
-    else:  # warn/low — coach가 생성한 7단 교육 답변을 사용
-        answer = state["answer"]
+        return {"answer": answer + CONTACT_FOOTER}
 
-    return {"answer": answer + CONTACT_FOOTER}
+    # warn/low — coach가 생성한 7단 교육 답변
+    body = state.get("answer", "")
+
+    if source_status == "not_found":
+        if risk == "warn":
+            notice = (
+                "ℹ️ 확인된 공식 자료를 찾지 못했어요. 아래는 일반적인 안내이며, "
+                "**주의가 필요한 상황이니 오늘 중 소아과 상담을 권해요.**\n\n"
+            )
+        else:  # low + not_found (§9): 침묵 대신 고지 후 일반 안내
+            notice = (
+                "ℹ️ 공식 문서엔 이 상황에 대한 특정 기준이 없지만, "
+                "일반적으로는 아래와 같이 안내드려요.\n\n"
+            )
+        body = notice + body
+
+    return {"answer": body + CONTACT_FOOTER}
 
 
 def out_of_scope_node(state: State):
@@ -254,29 +449,45 @@ def out_of_scope_node(state: State):
         "🍼 저는 **초보 부모를 위한 육아 교육 코치**예요.\n\n"
         "아기의 수면·수유·발달·안전·건강 신호처럼 육아와 관련된 고민을 도와드릴 수 있어요. "
         "그 외 주제(제품 추천, 일반 상식 등)는 제 역할 범위 밖이라 도와드리기 어려워요.\n\n"
-        "예: \"우리 애 2개월인데 열이 나요\", \"7개월인데 밤에 자주 깨요\" 처럼 물어봐 주세요!"
+        '예: "우리 애 2개월인데 열이 나요", "7개월인데 밤에 자주 깨요" 처럼 물어봐 주세요!'
     )
     return {"answer": answer + CONTACT_FOOTER}
 
 
 # ─────────────────────────────────────────────────────────
-# 5. 라우팅 함수 (조건부 edge)
+# 5. 라우팅 함수 (조건부 edge, 노트1)
 # ─────────────────────────────────────────────────────────
+def route_clarify(state: State):
+    """analyze 직후 첫 분기: 정보가 부족하면 되묻고, 충분하면 다음 분기로 (§7)."""
+    return "clarify" if state.get("needs_clarification") else "proceed"
+
+
 def route_scope(state: State):
-    """analyze 직후: 육아 질문이면 두 위험판단으로 fan-out, 아니면 거절 노드로.
+    """육아 질문이면 두 위험판단으로 fan-out(병렬), 아니면 거절 노드로 (§8).
 
     리스트를 반환하면 LangGraph가 그 노드들을 동시에(병렬) 실행한다.
-    무조건 edge로 rule_risk를 걸면 out_of_scope에도 실행돼 fan-in이 깨지므로,
-    병렬 fan-out은 반드시 이 조건부 안에서 함께 관리한다.
     """
     return ["llm_risk", "rule_risk"] if state["in_scope"] else "out_of_scope"
+
+
+def route_after_analyze(state: State):
+    """analyze 직후 실제 분기: clarify > out_of_scope > 병렬 위험판단 순으로 판정.
+
+    route_clarify와 route_scope를 합쳐 하나의 조건부 edge로 쓴다
+    (LangGraph는 노드당 조건부 edge 하나만 걸 수 있으므로).
+
+    안전 우선: rule이 이미 위험 신호(red_flags·발열 밴드)를 잡았다면 되묻지 않는다.
+    명백한 고위험(예: 2개월 39℃)을 '측정부위가 궁금해서' 되묻어 지연시키면 위험하다(§7).
+    """
+    if route_clarify(state) == "clarify" and rule_risk_node(state)["rule_risk"] == "low":
+        return "clarify"
+    return route_scope(state)
 
 
 def route_by_risk(state: State):
     """aggregate 직후: 위험도별 분기 (기획 §5).
 
-    high는 검색을 기다리지 않고 즉시 안내. warn/low는 모두 근거 검색 후
-    7단 코칭으로 합류한다(coach가 source를 인용하려면 search가 먼저여야 함).
+    high는 검색을 기다리지 않고 즉시 안내. warn/low는 근거 검색 후 7단 코칭으로.
     """
     return "decide" if state["risk"] == "high" else "search"
 
@@ -287,23 +498,24 @@ def route_by_risk(state: State):
 def build_graph():
     builder = StateGraph(State)
     builder.add_node("analyze", analyze_node)
+    builder.add_node("clarify", clarify_node)
     builder.add_node("out_of_scope", out_of_scope_node)
     builder.add_node("llm_risk", llm_risk_node)
     builder.add_node("rule_risk", rule_risk_node)
     builder.add_node("aggregate", aggregate_node)
-    builder.add_node("coach", coach_node)
     builder.add_node("search", search_node)
+    builder.add_node("coach", coach_node)
     builder.add_node("decide", decide_node)
 
     builder.add_edge(START, "analyze")
 
-    # 범위 판정 + 병렬 fan-out: in_scope면 [llm_risk, rule_risk] 동시 실행,
-    # 아니면 out_of_scope로. (route_scope가 리스트를 반환해 병렬을 표현)
+    # analyze 직후: 되묻기 / 범위 밖 / 병렬 위험판단 fan-out
     builder.add_conditional_edges(
         "analyze",
-        route_scope,
-        ["llm_risk", "rule_risk", "out_of_scope"],
+        route_after_analyze,
+        ["clarify", "out_of_scope", "llm_risk", "rule_risk"],
     )
+    builder.add_edge("clarify", END)
     builder.add_edge("out_of_scope", END)
 
     # fan-in: 두 위험판단이 모두 끝나면 aggregate
@@ -316,8 +528,8 @@ def build_graph():
         route_by_risk,
         {"decide": "decide", "search": "search"},
     )
-    builder.add_edge("search", "coach")        # warn/low: 근거 조회 후 7단 코칭
-    builder.add_edge("coach", "decide")        # 코칭 답변을 decide가 마무리(연락처 첨부)
+    builder.add_edge("search", "coach")  # warn/low: 근거 조회 후 7단 코칭
+    builder.add_edge("coach", "decide")  # 코칭 답변을 decide가 §9로 마무리
     builder.add_edge("decide", END)
     return builder.compile()
 
@@ -327,23 +539,39 @@ graph = build_graph()
 
 # ─────────────────────────────────────────────────────────
 # 7. self-check — 핵심 안전 로직이 깨지면 실패하는 최소 검증
+#    상세 결정론 테스트는 test_agent.py (pytest) 참고.
 # ─────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    # max() 안전 바닥: LLM이 low여도 rule이 high면 최종 high여야 한다
+    # max() 안전 바닥
     assert aggregate_node({"llm_risk": "low", "rule_risk": "high"})["risk"] == "high"
-    # rule 발열 밴드
-    assert rule_risk_node({"month": 2, "temp": 39})["rule_risk"] == "high"
-    assert rule_risk_node({"month": 5, "temp": 38.5})["rule_risk"] == "warn"
-    assert rule_risk_node({"month": 12, "temp": 36})["rule_risk"] == "low"
+    # rule 발열 밴드 + red_flags 상향
+    assert rule_risk_node({"month": 2, "temp": 39, "red_flags": []})["rule_risk"] == "high"
+    assert rule_risk_node({"month": 10, "temp": 36, "red_flags": ["seizure"]})["rule_risk"] == "high"
+    # §8 레지스트리
+    assert "childcare.go.kr" in lookup_guide(2, "수면")
+    assert lookup_guide(2, "없는주제") == "NOT_FOUND"
     print("self-check OK")
 
-    # end-to-end: 세션 프로필(name, month)을 주입하는 실사용 형태로 호출
+    # end-to-end
     out = graph.invoke(
         {"input": "열이 39도에요. 어떻게 하면 좋을까요?", "name": "민준", "month": 2}
     )
-    print(f"\n[high 케이스] risk={out['risk']} (llm={out['llm_risk']}, rule={out['rule_risk']})")
+    print(f"\n[high] risk={out['risk']} (llm={out['llm_risk']}, rule={out['rule_risk']})")
     print(out["answer"][:120], "...")
 
     out2 = graph.invoke({"input": "에어팟 추천해줘", "name": "민준", "month": 2})
     print(f"\n[out_of_scope] in_scope={out2['in_scope']}")
-    print(out2["answer"][:80], "...")
+
+    # 되묻기 없이 바로 코칭으로 가도록 상황을 충분히 서술한 low 케이스
+    out3 = graph.invoke(
+        {
+            "input": "7개월인데 요즘 밤에 2~3번 깨서 안아주면 다시 자요. 열도 없고 잘 놀아요.",
+            "name": "민준",
+            "month": 7,
+        }
+    )
+    if out3.get("needs_clarification"):
+        print("\n[clarify] 되묻기로 분기됨:", out3["answer"][:60], "...")
+    else:
+        print(f"\n[low] risk={out3['risk']} source={out3.get('source_status')}")
+        print(out3["answer"][:120], "...")

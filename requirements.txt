@@ -1,0 +1,6 @@
+# Streamlit Cloud 배포용 런타임 의존성 (핵심 패키지만).
+# 로컬 개발은 uv/pyproject.toml 사용. 이 파일은 Cloud 빌드 재현성을 위한 것.
+streamlit==1.59.2
+langgraph==0.6.6
+langchain[openai]==0.3.27
+python-dotenv==1.1.1
